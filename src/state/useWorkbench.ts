@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  Clip,
+  ClipDraft,
   LevelState,
   ListenerState,
   NamedProject,
@@ -10,7 +12,14 @@ import type {
   UnlockState,
 } from '../types';
 import { engine } from '../lib/engineInstance';
-import { DecodeError } from '../lib/audioEngine';
+import { ClipError, DecodeError } from '../lib/audioEngine';
+import { ClipValidationError, assertValidClip, migrateDoc } from '../lib/clip';
+import {
+  applyEntryToClips,
+  cloneClip,
+  entryRemovesClip,
+  type ClipHistoryEntry,
+} from '../lib/clipHistory';
 import * as idb from '../lib/idb';
 import { SAMPLE_LABELS } from '../lib/samples';
 
@@ -58,12 +67,14 @@ function sampleTrack(type: Exclude<SourceType, 'file'>, index: number): Track {
     color: COLORS[index % COLORS.length],
     position: { ...p.position },
     status: 'pending',
+    clips: [],
+    activeClipId: null,
   };
 }
 
 function emptyDoc(): ProjectDoc {
   return {
-    version: 1,
+    version: 2,
     tracks: [],
     listener: { ...DEFAULT_LISTENER, position: { ...DEFAULT_LISTENER.position } },
     spatial: { ...DEFAULT_SPATIAL },
@@ -113,6 +124,19 @@ export interface WorkbenchApi {
   deleteProject: (id: string) => Promise<void>;
   newProject: () => Promise<void>;
   dismissGlobalError: () => void;
+  // ---------- 非破坏性片段（只改编辑描述，绝不触碰原始 Blob） ----------
+  createClip: (trackId: string, draft: ClipDraft) => { ok: true; clipId: string } | { ok: false; issues: string[] };
+  /** 提交边界/淡化/循环修改；返回非法原因（空数组 = 已接受） */
+  commitClip: (trackId: string, clipId: string, draft: ClipDraft) => string[];
+  renameClip: (trackId: string, clipId: string, name: string) => void;
+  removeClip: (trackId: string, clipId: string) => void;
+  duplicateClip: (trackId: string, clipId: string) => void;
+  setActiveClip: (trackId: string, clipId: string | null) => void;
+  playClip: (trackId: string, clipId: string) => Promise<void>;
+  canUndoClips: boolean;
+  canRedoClips: boolean;
+  undo: () => void;
+  redo: () => void;
 }
 
 export function useWorkbench(): WorkbenchApi {
@@ -127,6 +151,10 @@ export function useWorkbench(): WorkbenchApi {
   const [loadedProjectName, setLoadedProjectName] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [globalError, setGlobalError] = useState<string | null>(null);
+  // 片段编辑历史只存在内存中：条目为编辑描述快照，回放只改描述
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const undoStack = useRef<ClipHistoryEntry[]>([]);
+  const redoStack = useRef<ClipHistoryEntry[]>([]);
 
   const docRef = useRef(doc);
   docRef.current = doc;
@@ -140,12 +168,13 @@ export function useWorkbench(): WorkbenchApi {
     let cancelled = false;
     (async () => {
       try {
-        const [session, list] = await Promise.all([idb.loadSession(), idb.listProjects()]);
+        const [sessionRaw, list] = await Promise.all([idb.loadSession(), idb.listProjects()]);
         if (cancelled) return;
         if (list) setProjects(list);
-        if (session) {
+        if (sessionRaw) {
           // 恢复全部参数，但播放状态一律归零（不擅自自动播放）。
-          // 文件轨标记 pending，待音频解锁后重新注入 Blob 解码。
+          // 文件轨标记 pending，待音频解锁后重新注入 Blob 解码；片段描述原样保留。
+          const session = migrateDoc(sessionRaw);
           setDoc({
             ...session,
             tracks: session.tracks.map((t) => ({
@@ -226,7 +255,7 @@ export function useWorkbench(): WorkbenchApi {
             }
           } catch {
             if (!cancelled) {
-              patchTrack(t.id, { status: 'decode-error', errorMessage: '读取本地音频失败' });
+              patchTrack(t.id, { status: 'decode-error', errorMessage: '读取本地音频失败（Blob 缺失或存储不可用）' });
             }
           }
         }
@@ -358,6 +387,8 @@ export function useWorkbench(): WorkbenchApi {
             z: Math.sin((idx * 2 * Math.PI) / Math.max(arr.length, 1)) * 2.5,
           },
           status: engine.unlock === 'unlocked' ? 'loading' : 'pending',
+          clips: [],
+          activeClipId: null,
         };
         setDoc((d) => ({ ...d, tracks: [...d.tracks, track] }));
         try {
@@ -419,6 +450,258 @@ export function useWorkbench(): WorkbenchApi {
     });
     setDoc((d) => ({ ...d, tracks: d.tracks.filter((x) => x.id !== id) }));
     setSelectedId((cur) => (cur === id ? null : cur));
+  }, []);
+
+  // ---------- 非破坏性片段：所有提交先校验，非法即拒绝；撤销只回放描述 ----------
+
+  /** 正在播放的片段改了描述：推给引擎，在安全边界换流（不重启无关轨/不双播） */
+  const armEngineClip = useCallback((trackId: string, clip: Clip) => {
+    if (engine.unlock !== 'unlocked') return;
+    try {
+      engine.armClip(trackId, clip);
+    } catch (err) {
+      // 引擎侧再校验失败不应发生（UI 已拦截）；上报而不是静默
+      setGlobalError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  const pushHistory = useCallback((entry: ClipHistoryEntry) => {
+    undoStack.current.push(entry);
+    redoStack.current = []; // 新编辑清空重做栈
+    setHistoryVersion((v) => v + 1);
+  }, []);
+
+  const createClip = useCallback(
+    (
+      trackId: string,
+      draft: ClipDraft,
+    ): { ok: true; clipId: string } | { ok: false; issues: string[] } => {
+      const track = docRef.current.tracks.find((x) => x.id === trackId);
+      if (!track) return { ok: false, issues: ['声轨不存在'] };
+      // 提交必须能对照已知原时长做越界判定；未就绪时拒绝而不是猜测
+      const duration = track.duration ?? null;
+      try {
+        assertValidClip(draft, duration);
+      } catch (err) {
+        if (err instanceof ClipValidationError) return { ok: false, issues: err.issues };
+        throw err;
+      }
+      const now = Date.now();
+      const clip: Clip = {
+        id: uid('clip'),
+        name: `片段 ${track.clips.length + 1}`,
+        trackId,
+        inPoint: draft.inPoint,
+        outPoint: draft.outPoint,
+        fadeIn: { ...draft.fadeIn },
+        fadeOut: { ...draft.fadeOut },
+        loop: { ...draft.loop },
+        sourceDuration: duration,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) =>
+          t.id === trackId ? { ...t, clips: [...t.clips, clip] } : t,
+        ),
+      }));
+      pushHistory({ type: 'create', trackId, clip: cloneClip(clip) });
+      return { ok: true, clipId: clip.id };
+    },
+    [pushHistory],
+  );
+
+  const commitClip = useCallback(
+    (trackId: string, clipId: string, draft: ClipDraft): string[] => {
+      const track = docRef.current.tracks.find((x) => x.id === trackId);
+      const before = track?.clips.find((c) => c.id === clipId);
+      if (!track || !before) return ['片段不存在'];
+      const duration = track.duration ?? before.sourceDuration;
+      try {
+        assertValidClip(draft, duration);
+      } catch (err) {
+        if (err instanceof ClipValidationError) return err.issues;
+        throw err;
+      }
+      const after: Clip = {
+        ...before,
+        inPoint: draft.inPoint,
+        outPoint: draft.outPoint,
+        fadeIn: { ...draft.fadeIn },
+        fadeOut: { ...draft.fadeOut },
+        loop: { ...draft.loop },
+        sourceDuration: duration,
+        version: before.version + 1,
+        updatedAt: Date.now(),
+      };
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) =>
+          t.id === trackId
+            ? { ...t, clips: t.clips.map((c) => (c.id === clipId ? after : c)) }
+            : t,
+        ),
+      }));
+      pushHistory({ type: 'update', trackId, before: cloneClip(before), after: cloneClip(after) });
+      armEngineClip(trackId, after);
+      return [];
+    },
+    [armEngineClip, pushHistory],
+  );
+
+  const renameClip = useCallback(
+    (trackId: string, clipId: string, name: string) => {
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) =>
+          t.id === trackId
+            ? {
+                ...t,
+                clips: t.clips.map((c) =>
+                  c.id === clipId ? { ...c, name, updatedAt: Date.now() } : c,
+                ),
+              }
+            : t,
+        ),
+      }));
+    },
+    [],
+  );
+
+  const removeClip = useCallback(
+    (trackId: string, clipId: string) => {
+      const track = docRef.current.tracks.find((x) => x.id === trackId);
+      const clip = track?.clips.find((c) => c.id === clipId);
+      if (!track || !clip) return;
+      if (engine.isPlaying(trackId) && engine.getClipProgress(trackId)?.clipId === clipId) {
+        engine.stopTrack(track);
+        setPlayingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(trackId);
+          return next;
+        });
+      }
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) => {
+          if (t.id !== trackId) return t;
+          return {
+            ...t,
+            clips: t.clips.filter((c) => c.id !== clipId),
+            activeClipId: t.activeClipId === clipId ? null : t.activeClipId,
+          };
+        }),
+      }));
+      pushHistory({ type: 'delete', trackId, clip: cloneClip(clip) });
+    },
+    [pushHistory],
+  );
+
+  const duplicateClip = useCallback(
+    (trackId: string, clipId: string) => {
+      const track = docRef.current.tracks.find((x) => x.id === trackId);
+      const src = track?.clips.find((c) => c.id === clipId);
+      if (!track || !src) return;
+      const now = Date.now();
+      const copy: Clip = {
+        ...cloneClip(src),
+        id: uid('clip'),
+        name: `${src.name} 副本`,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) =>
+          t.id === trackId ? { ...t, clips: [...t.clips, copy] } : t,
+        ),
+      }));
+      pushHistory({ type: 'create', trackId, clip: cloneClip(copy) });
+    },
+    [pushHistory],
+  );
+
+  const setActiveClip = useCallback((trackId: string, clipId: string | null) => {
+    setDoc((d) => ({
+      ...d,
+      tracks: d.tracks.map((t) => (t.id === trackId ? { ...t, activeClipId: clipId } : t)),
+    }));
+  }, []);
+
+  const playClip = useCallback(
+    async (trackId: string, clipId: string) => {
+      const track = docRef.current.tracks.find((x) => x.id === trackId);
+      const clip = track?.clips.find((c) => c.id === clipId);
+      if (!track || !clip) return;
+      if (engine.unlock !== 'unlocked') await unlockAudio();
+      try {
+        await engine.playClip(track, clip);
+        setPlayingIds((prev) => new Set(prev).add(trackId));
+      } catch (err) {
+        // 片段不可播有独立原因（解码失败/Blob 缺失/时长变化/非法范围），
+        // 不进入 playing 状态，绝不以静音假成功
+        if (err instanceof ClipError) {
+          setGlobalError(`片段「${clip.name}」：${err.message}`);
+        } else if (err instanceof DecodeError) {
+          patchTrack(trackId, { status: 'decode-error', errorMessage: err.message });
+        } else {
+          setGlobalError(err instanceof Error ? err.message : String(err));
+        }
+      }
+    },
+    [unlockAudio],
+  );
+
+  /** 撤销后把恢复的描述同步到正在播放的引擎（仍走安全边界） */
+  const syncRestoredClip = useCallback(
+    (trackId: string, clip: Clip) => {
+      if (engine.unlock !== 'unlocked') return;
+      if (engine.getClipProgress(trackId)?.clipId === clip.id) armEngineClip(trackId, clip);
+    },
+    [armEngineClip],
+  );
+
+  /** 撤销/重做共用：只对片段描述做不可变整体替换，绝不增量改写，杜绝累积误差 */
+  const replayHistory = useCallback(
+    (dir: 'undo' | 'redo') => {
+      const from = dir === 'undo' ? undoStack.current : redoStack.current;
+      const to = dir === 'redo' ? undoStack.current : redoStack.current;
+      const entry = from.pop();
+      if (!entry) return;
+      to.push(entry);
+      const removedId = entryRemovesClip(entry, dir);
+      let restored: Clip | null = null;
+      if (entry.type === 'update') restored = dir === 'undo' ? entry.before : entry.after;
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) => {
+          if (t.id !== entry.trackId) return t;
+          const clips = applyEntryToClips(t.clips, entry, dir);
+          return {
+            ...t,
+            clips,
+            activeClipId:
+              removedId && t.activeClipId === removedId ? null : t.activeClipId,
+          };
+        }),
+      }));
+      if (restored) syncRestoredClip(entry.trackId, restored);
+      setHistoryVersion((v) => v + 1);
+    },
+    [syncRestoredClip],
+  );
+
+  const undo = useCallback(() => replayHistory('undo'), [replayHistory]);
+  const redo = useCallback(() => replayHistory('redo'), [replayHistory]);
+
+  // 片段编辑历史随工程切换清空（历史不入持久化）
+  const clearClipHistory = useCallback(() => {
+    undoStack.current = [];
+    redoStack.current = [];
+    setHistoryVersion((v) => v + 1);
   }, []);
 
   const updateTrack = useCallback(
@@ -496,6 +779,8 @@ export function useWorkbench(): WorkbenchApi {
       } catch (err) {
         if (err instanceof DecodeError) {
           patchTrack(id, { status: 'decode-error', errorMessage: err.message });
+        } else if (err instanceof ClipError) {
+          setGlobalError(err.message);
         } else {
           setGlobalError(err instanceof Error ? err.message : String(err));
         }
@@ -560,6 +845,8 @@ export function useWorkbench(): WorkbenchApi {
       } catch (err) {
         if (err instanceof DecodeError) {
           patchTrack(t.id, { status: 'decode-error', errorMessage: err.message });
+        } else if (err instanceof ClipError) {
+          setGlobalError(err.message);
         }
       }
     }
@@ -599,18 +886,17 @@ export function useWorkbench(): WorkbenchApi {
 
   const loadProject = useCallback(
     async (id: string) => {
-      const p = await idb.getProject(id);
-      if (!p) return;
+      const p0 = await idb.getProject(id);
+      if (!p0) return;
+      const p = { ...p0, doc: migrateDoc(p0.doc) };
       // 先拆除当前声轨节点
       for (const t of docRef.current.tracks) engine.removeTrack(t.id);
       setPlayingIds(new Set());
+      clearClipHistory();
       const restored: ProjectDoc = {
         ...p.doc,
-        tracks: p.doc.tracks.map((t) => ({
-          ...t,
-          // 内置样例可重建；文件声轨等待 Blob 注入解码；不自动播放
-          status: t.sourceType === 'file' ? 'pending' : 'pending',
-        })),
+        // 内置样例可重建；文件声轨等待 Blob 注入解码；不自动播放
+        tracks: p.doc.tracks.map((t) => ({ ...t, status: 'pending' as const })),
       };
       setDoc(restored);
       setLoadedProjectId(p.id);
@@ -640,7 +926,7 @@ export function useWorkbench(): WorkbenchApi {
         }
       }
     },
-    [],
+    [clearClipHistory],
   );
 
   const deleteProject = useCallback(
@@ -662,7 +948,8 @@ export function useWorkbench(): WorkbenchApi {
     setLoadedProjectId(null);
     setLoadedProjectName(null);
     setSelectedId(null);
-  }, []);
+    clearClipHistory();
+  }, [clearClipHistory]);
 
   const dismissGlobalError = useCallback(() => setGlobalError(null), []);
 
@@ -703,6 +990,17 @@ export function useWorkbench(): WorkbenchApi {
       deleteProject,
       newProject,
       dismissGlobalError,
+      createClip,
+      commitClip,
+      renameClip,
+      removeClip,
+      duplicateClip,
+      setActiveClip,
+      playClip,
+      canUndoClips: undoStack.current.length > 0,
+      canRedoClips: redoStack.current.length > 0,
+      undo,
+      redo,
     }),
     [
       doc,
@@ -716,6 +1014,7 @@ export function useWorkbench(): WorkbenchApi {
       loadedProjectName,
       saveState,
       globalError,
+      historyVersion,
       selectTrack,
       unlockAudio,
       addSample,
@@ -740,6 +1039,15 @@ export function useWorkbench(): WorkbenchApi {
       deleteProject,
       newProject,
       dismissGlobalError,
+      createClip,
+      commitClip,
+      renameClip,
+      removeClip,
+      duplicateClip,
+      setActiveClip,
+      playClip,
+      undo,
+      redo,
     ],
   );
 

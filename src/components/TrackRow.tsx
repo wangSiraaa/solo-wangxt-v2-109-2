@@ -30,6 +30,16 @@ export function TrackRow({ track, api }: Props) {
   const [progress, setProgress] = useState(0);
   const listener: ListenerState = doc.listener;
   const spatial: SpatialSettings = doc.spatial;
+  const activeClip = track.activeClipId
+    ? track.clips.find((c) => c.id === track.activeClipId) ?? null
+    : null;
+  // 正在播放的片段可能与“活动片段”不同（换流边界前）；进度条跟随实际播放的片段
+  const playingClipId = engine.playingClipId(track.id);
+  const progressClip = track.clips.find((c) => c.id === playingClipId) ?? activeClip;
+  // 进度条在片段下映射到“片段本地时间轴”；否则为原始整轨时间
+  const timelineDuration = progressClip
+    ? progressClip.outPoint - progressClip.inPoint
+    : track.duration ?? 0;
 
   // 播放进度（rAF 轮询引擎读数；停止/暂停自动冻结）
   useEffect(() => {
@@ -142,17 +152,45 @@ export function TrackRow({ track, api }: Props) {
       <div
         className="track-progress"
         onClick={(e) => {
-          if (track.duration == null) return;
+          if (!timelineDuration) return;
           const rect = e.currentTarget.getBoundingClientRect();
           const ratio = (e.clientX - rect.left) / rect.width;
-          void api.seek(track.id, ratio * track.duration);
+          void api.seek(track.id, ratio * timelineDuration);
         }}
       >
-        <div className="track-progress-fill" style={{ width: `${track.duration ? (progress / track.duration) * 100 : 0}%` }} />
+        {progressClip && (
+          <div
+            className="track-progress-loop"
+            style={{
+              left: `${((progressClip.loop.enabled ? progressClip.loop.inPoint : progressClip.inPoint) - progressClip.inPoint) / (timelineDuration || 1) * 100}%`,
+              width: `${((progressClip.loop.enabled ? progressClip.loop.outPoint : progressClip.outPoint) - (progressClip.loop.enabled ? progressClip.loop.inPoint : progressClip.inPoint)) / (timelineDuration || 1) * 100}%`,
+            }}
+            title={progressClip.loop.enabled ? '循环区间' : '片段区间'}
+          />
+        )}
+        <div className="track-progress-fill" style={{ width: `${timelineDuration ? (progress / timelineDuration) * 100 : 0}%` }} />
         <span className="track-time">
-          {fmt(progress)} / {fmt(track.duration ?? null)}
+          {fmt(progress)} / {fmt(timelineDuration || null)}
+          {progressClip ? `（片段 · 原 ${fmt(progressClip.inPoint)}–${fmt(progressClip.outPoint)}）` : ''}
         </span>
       </div>
+
+      {track.clips.length > 0 && (
+        <div className="track-clips">
+          {track.clips.map((c) => (
+            <button
+              key={c.id}
+              className={`clip-chip ${track.activeClipId === c.id ? 'active' : ''}`}
+              onClick={() =>
+                api.setActiveClip(track.id, track.activeClipId === c.id ? null : c.id)
+              }
+              title={`${c.name}：原 ${fmt(c.inPoint)}–${fmt(c.outPoint)} · v${c.version}`}
+            >
+              {c.name}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="track-spatial-readout">
         <span className={az > 0 ? 'side-r' : az < 0 ? 'side-l' : ''}>{describeAzimuth(az)}</span>

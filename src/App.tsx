@@ -4,6 +4,7 @@ import { Scene3DView } from './components/Scene3DView';
 import { Plan2D } from './components/Plan2D';
 import { TrackRow } from './components/TrackRow';
 import { Inspector } from './components/Inspector';
+import { ClipPanel } from './components/ClipPanel';
 import { ListenerPanel } from './components/ListenerPanel';
 import { SpatialPanel } from './components/SpatialPanel';
 import { MasterBar } from './components/MasterBar';
@@ -14,6 +15,7 @@ import type { Vec3 } from './types';
 export default function App() {
   const api = useWorkbench();
   const [view, setView] = useState<'3d' | '2d'>('3d');
+  const selectedTrack = api.doc.tracks.find((t) => t.id === api.selectedId) ?? null;
 
   const onMoveSource = useCallback(
     (id: string, pos: Vec3) => api.moveTrack(id, pos),
@@ -99,6 +101,7 @@ export default function App() {
         <aside className="sidebar right">
           <ListenerPanel api={api} />
           <Inspector api={api} />
+          {selectedTrack && <ClipPanel key={selectedTrack.id} track={selectedTrack} api={api} />}
           <SpatialPanel api={api} />
         </aside>
       </div>
