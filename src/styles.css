@@ -744,3 +744,205 @@ input[type='range'] {
   align-items: center;
   max-width: 600px;
 }
+
+/* ---------- 非破坏性片段 ---------- */
+.clip-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.clip-toolbar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.clip-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.clip-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.clip-item.selected {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 1px var(--accent-2) inset;
+}
+.clip-item.blocked {
+  border-color: rgba(248, 113, 113, 0.5);
+}
+.clip-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.clip-name {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.clip-rev {
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.clip-item-actions {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.clip-pending {
+  font-size: 10px;
+  color: var(--warn);
+}
+.clip-issue {
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 4px 6px;
+  border-radius: 5px;
+}
+.clip-issue.error {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.12);
+}
+.clip-issue.warn {
+  color: #fde68a;
+  background: rgba(255, 224, 102, 0.1);
+}
+.clip-progress {
+  position: relative;
+  height: 16px;
+  background: #0c1017;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  overflow: hidden;
+}
+.clip-progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(127, 209, 255, 0.35);
+}
+.clip-time {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--muted);
+}
+.clip-editor {
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.clip-editor.blocked {
+  color: #fecaca;
+  font-size: 12px;
+}
+.clip-editor-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+.clip-region-track {
+  position: relative;
+  height: 46px;
+  background: #0c1017;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: default;
+}
+.clip-region-selected-real {
+  position: absolute;
+  top: 12px;
+  bottom: 10px;
+  background: rgba(127, 209, 255, 0.18);
+  border: 1px solid var(--accent-2);
+  border-radius: 3px;
+}
+.clip-fade-in {
+  position: absolute;
+  top: 12px;
+  bottom: 10px;
+  background: linear-gradient(90deg, rgba(255, 224, 102, 0.55), rgba(255, 224, 102, 0.05));
+  pointer-events: none;
+}
+.clip-fade-out {
+  position: absolute;
+  top: 12px;
+  bottom: 10px;
+  background: linear-gradient(270deg, rgba(255, 224, 102, 0.55), rgba(255, 224, 102, 0.05));
+  pointer-events: none;
+}
+.clip-loop-mark {
+  position: absolute;
+  top: 4px;
+  bottom: 6px;
+  width: 0;
+  border-left: 2px dashed var(--accent);
+  pointer-events: none;
+}
+.clip-handle {
+  position: absolute;
+  top: 2px;
+  width: 16px;
+  height: 42px;
+  transform: translateX(-50%);
+  cursor: ew-resize;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  z-index: 2;
+}
+.clip-handle span {
+  font-size: 9px;
+  background: var(--accent-2);
+  color: #08121a;
+  border-radius: 3px;
+  padding: 0 3px;
+  line-height: 13px;
+}
+.clip-region-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+}
+.clip-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.clip-loop-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.clip-reject {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+}

@@ -125,6 +125,14 @@ export function TrackRow({ track, api }: Props) {
         <button className="btn small ghost danger" onClick={() => api.removeTrack(track.id)} title="删除">
           ✕
         </button>
+        <button
+          className="btn small ghost"
+          onClick={() => void api.clipApi.createClip(track.id)}
+          disabled={track.status === 'decode-error'}
+          title="基于该声轨当前原始音频建立非破坏性片段（不复制音频）"
+        >
+          ✀ 建片段
+        </button>
       </div>
 
       <div className="track-gain">

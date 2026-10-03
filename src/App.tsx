@@ -9,6 +9,7 @@ import { SpatialPanel } from './components/SpatialPanel';
 import { MasterBar } from './components/MasterBar';
 import { ProjectBar } from './components/ProjectBar';
 import { UnlockOverlay } from './components/UnlockOverlay';
+import { ClipPanel } from './components/ClipPanel';
 import type { Vec3 } from './types';
 
 export default function App() {
@@ -100,6 +101,7 @@ export default function App() {
           <ListenerPanel api={api} />
           <Inspector api={api} />
           <SpatialPanel api={api} />
+          <ClipPanel api={api} />
         </aside>
       </div>
 
